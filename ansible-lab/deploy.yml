@@ -1,0 +1,337 @@
+---
+- name: Preparar los secretos locales del laboratorio
+  hosts: localhost
+  gather_facts: false
+  vars:
+    secrets_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/.config/attendance-lab"
+  tasks:
+    - name: Crear el directorio privado de secretos en WSL
+      ansible.builtin.file:
+        path: "{{ secrets_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Generar o recuperar los secretos del laboratorio
+      ansible.builtin.set_fact:
+        lab_db_password: "{{ lookup('ansible.builtin.password', secrets_dir + '/db-password', length=48, chars=['ascii_letters', 'digits']) }}"
+        lab_jwt_secret: "{{ lookup('ansible.builtin.password', secrets_dir + '/jwt-secret', length=64, chars=['ascii_letters', 'digits']) }}"
+        lab_demo_password: "{{ lookup('ansible.builtin.password', secrets_dir + '/demo-admin-password', length=24, chars=['ascii_letters', 'digits']) }}"
+      no_log: true
+
+- name: Configurar la base de datos privada del laboratorio
+  hosts: database
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    backend_ip: "{{ hostvars[groups['backend'][0]].private_ip }}"
+  tasks:
+    - name: Identificar la configuración activa de PostgreSQL
+      ansible.builtin.command:
+        argv: [runuser, -u, postgres, --, psql, -XAt, -d, postgres, -c, SHOW hba_file]
+      register: postgres_hba
+      changed_when: false
+
+    - name: Comprobar que PostgreSQL admite TLS
+      ansible.builtin.command:
+        argv: [runuser, -u, postgres, --, psql, -XAt, -d, postgres, -c, SHOW ssl]
+      register: postgres_ssl
+      changed_when: false
+      failed_when: postgres_ssl.rc != 0 or postgres_ssl.stdout != 'on'
+
+    - name: Crear el usuario y la base de Attendance si faltan
+      ansible.builtin.command:
+        argv: [runuser, -u, postgres, --, psql, -X, -d, postgres, -v, ON_ERROR_STOP=1]
+        stdin: |
+          \getenv role_password ATTENDANCE_DB_PASSWORD
+          SELECT format('CREATE ROLE attendance_app LOGIN PASSWORD %L', :'role_password')
+          WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'attendance_app')
+          \gexec
+          SELECT 'CREATE DATABASE attendance_lab OWNER attendance_app'
+          WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'attendance_lab')
+          \gexec
+      environment:
+        ATTENDANCE_DB_PASSWORD: "{{ hostvars['localhost'].lab_db_password }}"
+      register: postgres_created
+      changed_when: "'CREATE ROLE' in postgres_created.stdout_lines or 'CREATE DATABASE' in postgres_created.stdout_lines"
+      no_log: true
+
+    - name: Escuchar en loopback y en la IP privada de la base
+      ansible.builtin.copy:
+        dest: "{{ postgres_hba.stdout | dirname }}/conf.d/attendance.conf"
+        content: "listen_addresses = 'localhost,{{ ansible_host }}'\n"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reiniciar PostgreSQL
+
+    - name: Autorizar el usuario de Attendance desde el backend con TLS y SCRAM
+      ansible.builtin.lineinfile:
+        path: "{{ postgres_hba.stdout }}"
+        regexp: '^hostssl\s+attendance_lab\s+attendance_app\s+'
+        line: "hostssl attendance_lab attendance_app {{ backend_ip }}/32 scram-sha-256"
+      notify: Reiniciar PostgreSQL
+
+    - name: Aplicar la configuración de PostgreSQL
+      ansible.builtin.meta: flush_handlers
+
+    - name: Comprobar que la base escucha en su IP privada
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 5432
+        timeout: 20
+  handlers:
+    - name: Reiniciar PostgreSQL
+      ansible.builtin.systemd_service:
+        name: postgresql
+        state: restarted
+
+- name: Compilar los proyectos locales en sus EC2
+  hosts: backend:frontend
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    source_name: "{{ 'attendance-core' if inventory_hostname in groups['backend'] else 'attendance-web' }}"
+    source_dir: "{{ (playbook_dir + '/../../diplo-app-attendance/' + source_name) | realpath }}"
+    cache_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/.cache/attendance-lab"
+  tasks:
+    - name: Identificar el commit local que se desplegará
+      ansible.builtin.command:
+        argv: [git, -c, "safe.directory={{ source_dir }}", -C, "{{ source_dir }}", rev-parse, HEAD]
+      delegate_to: localhost
+      register: source_commit
+      changed_when: false
+
+    - name: Definir las rutas de la versión
+      ansible.builtin.set_fact:
+        source_archive: "{{ cache_dir }}/{{ source_name }}-{{ source_commit.stdout }}.tar.gz"
+        app_release: "/opt/attendance/releases/{{ source_commit.stdout }}"
+
+    - name: Crear el directorio privado para los paquetes de código
+      ansible.builtin.file:
+        path: "{{ cache_dir }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Empaquetar el código versionado del proyecto
+      ansible.builtin.command:
+        argv: [git, -c, "safe.directory={{ source_dir }}", -C, "{{ source_dir }}", archive, --format=tar.gz, --output, "{{ source_archive }}", "{{ source_commit.stdout }}"]
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Preparar el directorio remoto de la versión
+      ansible.builtin.file:
+        path: "{{ app_release }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+      become: true
+
+    - name: Copiar y extraer el código de la versión
+      ansible.builtin.unarchive:
+        src: "{{ source_archive }}"
+        dest: "{{ app_release }}"
+
+    - name: Instalar dependencias y compilar la versión
+      ansible.builtin.shell:
+        cmd: pnpm install --frozen-lockfile && pnpm build && touch .build-ready
+        chdir: "{{ app_release }}"
+        creates: "{{ app_release }}/.build-ready"
+      environment:
+        NODE_ENV: development
+        VITE_API_URL: /core/api/v1
+        VITE_DEFAULT_TENANT: demo
+
+- name: Migrar la base y activar el backend
+  hosts: backend
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    database_ip: "{{ hostvars[groups['database'][0]].ansible_host }}"
+    frontend_ip: "{{ hostvars[groups['frontend'][0]].ansible_host }}"
+    backend_env:
+      NODE_ENV: production
+      PORT: '5000'
+      CORS_ORIGIN: "http://{{ frontend_ip }}"
+      DB_SSL: 'true'
+      DB_READ_HOST: "{{ database_ip }}"
+      DB_READ_PORT: '5432'
+      DB_READ_USERNAME: attendance_app
+      DB_READ_PASSWORD: "{{ hostvars['localhost'].lab_db_password }}"
+      DB_READ_NAME: attendance_lab
+      DB_WRITE_HOST: "{{ database_ip }}"
+      DB_WRITE_PORT: '5432'
+      DB_WRITE_USERNAME: attendance_app
+      DB_WRITE_PASSWORD: "{{ hostvars['localhost'].lab_db_password }}"
+      DB_WRITE_NAME: attendance_lab
+      JWT_SECRET: "{{ hostvars['localhost'].lab_jwt_secret }}"
+      JWT_EXPIRES_IN: 8h
+  tasks:
+    - name: Ejecutar las migraciones pendientes
+      ansible.builtin.command:
+        argv: [pnpm, db:migrate, --env, development]
+        chdir: "{{ app_release }}"
+      become: false
+      environment: "{{ backend_env }}"
+      register: migrations
+      changed_when: "'migrated' in migrations.stdout"
+
+    - name: Buscar la institución de prueba en la base
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -XAt
+          - -d
+          - attendance_lab
+          - -c
+          - "SELECT 1 FROM tenants WHERE slug = 'demo'"
+      delegate_to: "{{ groups['database'][0] }}"
+      register: demo_tenant
+      changed_when: false
+
+    - name: Cargar la institución demo con una contraseña generada
+      ansible.builtin.command:
+        argv: [pnpm, exec, sequelize-cli, db:seed, --seed, 20261013000001-demo-tenant.js, --env, development]
+        chdir: "{{ app_release }}"
+      become: false
+      environment: "{{ backend_env | combine({'SEED_ADMIN_PASSWORD': hostvars['localhost'].lab_demo_password}) }}"
+      when: demo_tenant.stdout != '1'
+      no_log: true
+
+    - name: Crear el directorio privado del backend
+      ansible.builtin.file:
+        path: /etc/attendance
+        state: directory
+        mode: '0700'
+
+    - name: Escribir el entorno privado del servicio
+      ansible.builtin.copy:
+        dest: /etc/attendance/backend.env
+        mode: '0600'
+        content: |
+          {% for key, value in backend_env | dictsort %}
+          {{ key }}={{ value }}
+          {% endfor %}
+      no_log: true
+      notify: Reiniciar Attendance
+
+    - name: Activar la versión compilada del backend
+      ansible.builtin.file:
+        src: "{{ app_release }}"
+        dest: /opt/attendance/backend-current
+        state: link
+      notify: Reiniciar Attendance
+
+    - name: Instalar la unidad systemd de Attendance
+      ansible.builtin.copy:
+        src: attendance-backend.service
+        dest: /etc/systemd/system/attendance-backend.service
+        mode: '0644'
+      notify: Reiniciar Attendance
+
+    - name: Aplicar los cambios del backend
+      ansible.builtin.meta: flush_handlers
+
+    - name: Mantener el backend habilitado y activo
+      ansible.builtin.systemd_service:
+        name: attendance-backend
+        enabled: true
+        state: started
+
+    - name: Comprobar la API del backend
+      ansible.builtin.uri:
+        url: http://127.0.0.1:5000/core/api/v1
+      register: backend_health
+      until: backend_health.status == 200
+      retries: 15
+      delay: 2
+  handlers:
+    - name: Reiniciar Attendance
+      ansible.builtin.systemd_service:
+        name: attendance-backend
+        daemon_reload: true
+        state: restarted
+
+- name: Publicar Attendance y verificar el acceso por el frontend
+  hosts: frontend
+  become: true
+  gather_facts: false
+  vars:
+    backend_ip: "{{ hostvars[groups['backend'][0]].private_ip }}"
+  tasks:
+    - name: Crear el directorio web de Attendance
+      ansible.builtin.file:
+        path: /var/www/attendance
+        state: directory
+        mode: '0755'
+
+    - name: Publicar la versión compilada del frontend
+      ansible.builtin.file:
+        src: "{{ app_release }}/dist"
+        dest: /var/www/attendance/current
+        state: link
+
+    - name: Configurar Nginx para el frontend y la API privada
+      ansible.builtin.template:
+        src: attendance-nginx.conf.j2
+        dest: /etc/nginx/sites-available/attendance
+        mode: '0644'
+      notify: Recargar Nginx
+
+    - name: Habilitar el sitio de Attendance
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/attendance
+        dest: /etc/nginx/sites-enabled/attendance
+        state: link
+      notify: Recargar Nginx
+
+    - name: Deshabilitar la página de bienvenida de Nginx
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Recargar Nginx
+
+    - name: Validar la configuración de Nginx antes de recargar
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Aplicar los cambios de Nginx
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verificar que Nginx sirve la aplicación y su ruta de inicio
+      ansible.builtin.uri:
+        url: "http://127.0.0.1{{ item }}"
+        return_content: true
+      loop:
+        - /
+        - /login
+      register: web_response
+      failed_when: web_response.status != 200 or 'Control de asistencia' not in web_response.content
+
+    - name: Verificar el inicio de sesión de demo a través de Nginx
+      ansible.builtin.uri:
+        url: http://127.0.0.1/core/api/v1/auth/student/login
+        method: POST
+        body_format: json
+        body:
+          tenant: demo
+          identifier: '1001'
+        status_code: 200
+      no_log: true
+
+    - name: Mostrar la URL de Attendance
+      ansible.builtin.debug:
+        msg: "Attendance está disponible en http://{{ ansible_host }}/"
+  handlers:
+    - name: Recargar Nginx
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: reloaded

@@ -1,0 +1,12 @@
+[frontend]
+attendance-frontend ansible_host=${frontend_public_ip}
+
+[backend]
+attendance-backend ansible_host=${backend_public_ip} private_ip=${backend_private_ip}
+
+[database]
+attendance-database ansible_host=${database_private_ip} ansible_ssh_common_args='-o ProxyJump=ubuntu@${backend_public_ip}'
+
+[all:vars]
+ansible_user=ubuntu
+ansible_python_interpreter=/usr/bin/python3

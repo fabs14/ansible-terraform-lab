@@ -1,0 +1,128 @@
+---
+- name: Instalar PostgreSQL en la base privada
+  hosts: database
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Comprobar que el túnel de APT está abierto
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 1080
+        timeout: 5
+        msg: Abre el túnel SSH inverso para descargar los paquetes de PostgreSQL.
+
+    - name: Instalar PostgreSQL desde Ubuntu por el túnel
+      ansible.builtin.apt:
+        name: postgresql
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      environment:
+        http_proxy: socks5h://127.0.0.1:1080
+        https_proxy: socks5h://127.0.0.1:1080
+
+    - name: Habilitar e iniciar PostgreSQL
+      ansible.builtin.systemd_service:
+        name: postgresql
+        enabled: true
+        state: started
+
+    - name: Confirmar que PostgreSQL acepta conexiones locales
+      ansible.builtin.command: pg_isready -q
+      changed_when: false
+
+- name: Instalar Node.js y pnpm en los servidores de aplicación
+  hosts: frontend:backend
+  become: true
+  gather_facts: false
+  vars:
+    node_version: '24.15.0'
+    pnpm_version: '10.11.0'
+    node_release: "node-v{{ node_version }}-linux-x64"
+    node_download: "https://nodejs.org/dist/v{{ node_version }}"
+    node_dir: "/opt/{{ node_release }}"
+    pnpm_dir: "/opt/pnpm-{{ pnpm_version }}"
+  tasks:
+    - name: Instalar los requisitos de la descarga
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - xz-utils
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Descargar Node.js y verificar SHA-256
+      ansible.builtin.get_url:
+        url: "{{ node_download }}/{{ node_release }}.tar.xz"
+        checksum: "sha256:{{ node_download }}/SHASUMS256.txt"
+        dest: "/opt/{{ node_release }}.tar.xz"
+        mode: '0644'
+
+    - name: Extraer Node.js en /opt
+      ansible.builtin.unarchive:
+        src: "/opt/{{ node_release }}.tar.xz"
+        dest: /opt
+        remote_src: true
+        extra_opts:
+          - --no-same-owner
+
+    - name: Habilitar Node.js y npm en el PATH
+      ansible.builtin.file:
+        src: "{{ node_dir }}/bin/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+      loop:
+        - node
+        - npm
+
+    - name: Instalar la versión de pnpm del proyecto
+      ansible.builtin.command:
+        argv:
+          - "{{ node_dir }}/bin/node"
+          - "{{ node_dir }}/lib/node_modules/npm/bin/npm-cli.js"
+          - install
+          - --global
+          - --prefix
+          - "{{ pnpm_dir }}"
+          - "pnpm@{{ pnpm_version }}"
+        creates: "{{ pnpm_dir }}/bin/pnpm"
+
+    - name: Habilitar pnpm en el PATH
+      ansible.builtin.file:
+        src: "{{ pnpm_dir }}/bin/pnpm"
+        dest: /usr/local/bin/pnpm
+        state: link
+
+    - name: Verificar las versiones instaladas
+      ansible.builtin.command:
+        argv:
+          - "{{ item.path }}"
+          - --version
+      loop:
+        - { path: /usr/local/bin/node, version: "v{{ node_version }}" }
+        - { path: /usr/local/bin/pnpm, version: "{{ pnpm_version }}" }
+      register: installed_version
+      changed_when: false
+      failed_when: installed_version.rc != 0 or installed_version.stdout != item.version
+
+- name: Instalar el servidor web en el frontend
+  hosts: frontend
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Instalar Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Habilitar e iniciar Nginx
+      ansible.builtin.systemd_service:
+        name: nginx
+        enabled: true
+        state: started
+
+    - name: Confirmar que Nginx responde por HTTP
+      ansible.builtin.uri:
+        url: http://127.0.0.1/
+        status_code: 200

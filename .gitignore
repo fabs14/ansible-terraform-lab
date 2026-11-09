@@ -1,0 +1,11 @@
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+*.pem
+*.key
+/ansible-lab/inventory.ini

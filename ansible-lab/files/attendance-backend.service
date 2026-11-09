@@ -1,0 +1,20 @@
+[Unit]
+Description=Attendance NestJS API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/attendance/backend-current
+EnvironmentFile=/etc/attendance/backend.env
+ExecStart=/usr/local/bin/node dist/src/main.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
